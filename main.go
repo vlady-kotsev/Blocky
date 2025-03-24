@@ -2,6 +2,7 @@ package main
 
 import (
 	"vlady-kotsev/blocky/blockchain"
+	"vlady-kotsev/blocky/cli"
 
 	"github.com/dgraph-io/badger/v4"
 )
@@ -14,13 +15,15 @@ func main() {
 		panic(err)
 	}
 	defer db.Close()
-	chain, err := blockchain.InitBlockchain(db)
+	address := "123"
+	chain, err := blockchain.InitBlockchain(db, address)
 	if err != nil {
 		panic(err)
 	}
-	cli := CommandLine{
-		blockchain: chain,
-	}
+	cli := cli.NewCLI(chain)
 
-	cli.run()
+	err = cli.Run()
+	if err != nil {
+		panic(err)
+	}
 }

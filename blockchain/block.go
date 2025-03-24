@@ -4,30 +4,26 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/gob"
+	"vlady-kotsev/blocky/blockchain/transaction"
 )
 
 type Block struct {
-	Hash     []byte
-	Data     []byte
-	PrevHash []byte
-	Nonce    uint64
+	Hash         []byte
+	Transactions []*transaction.Transaction
+	PrevHash     []byte
+	Nonce        uint64
 }
 
-func CreateGenesis() *Block {
-	zeroHash := [32]byte{}
-	data := []byte(GenesisData)
-	bytes := bytes.Join([][]byte{
-		data,
-		zeroHash[:],
-	}, []byte{})
-
-	hash := sha256.Sum256(bytes)
-	return &Block{
-		Data:     data,
-		PrevHash: zeroHash[:],
-		Hash:     hash[:],
-		Nonce:    0,
+func (b *Block) HashTransactions() []byte {
+	var txHashes [][]byte
+	for _, tx := range b.Transactions {
+		txHashes = append(txHashes, tx.ID)
 	}
+
+	txBytes := bytes.Join(txHashes, []byte{})
+	txHash := sha256.Sum256(txBytes)
+
+	return txHash[:]
 }
 
 func (b *Block) SerializeBlock() ([]byte, error) {

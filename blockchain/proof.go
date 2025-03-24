@@ -32,7 +32,7 @@ func CreateProofOfWork() *ProofOfWork {
 
 func (pow *ProofOfWork) InitData(block *Block, nonce uint64) []byte {
 	data := bytes.Join([][]byte{
-		block.Data,
+		block.HashTransactions(),
 		block.PrevHash,
 		IntToBytes(InitialDifficulty),
 		IntToBytes(nonce),

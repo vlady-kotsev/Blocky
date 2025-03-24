@@ -1,7 +1,11 @@
 package blockchain
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"vlady-kotsev/blocky/blockchain/transaction"
 
 	"github.com/dgraph-io/badger/v4"
 )
@@ -14,19 +18,18 @@ type Blockchain struct {
 	Pow      *ProofOfWork
 }
 
-type BlockchainIterator struct {
-	CurrentHash []byte
-	DB          *badger.DB
-}
-
-func InitBlockchain(db *badger.DB) (*Blockchain, error) {
+func InitBlockchain(db *badger.DB, address string) (*Blockchain, error) {
 	pow := CreateProofOfWork()
 	chain := Blockchain{Pow: pow, DB: db}
 
 	err := chain.DB.Update(func(txn *badger.Txn) error {
 		if _, err := txn.Get([]byte(LashHashKey)); err == badger.ErrKeyNotFound {
 			fmt.Println("No existing blockchain found")
-			genesis := CreateGenesis()
+			coinbaseTx, err := transaction.CoinbaseTx(address, GenesisTxData)
+			if err != nil {
+				return err
+			}
+			genesis := CreateGenesis(coinbaseTx)
 			genesisSerialized, err := genesis.SerializeBlock()
 			if err != nil {
 				return err
@@ -61,10 +64,10 @@ func InitBlockchain(db *badger.DB) (*Blockchain, error) {
 	return &chain, nil
 }
 
-func (bc *Blockchain) CreateBlock(data string, prevHash []byte) *Block {
+func (bc *Blockchain) CreateBlock(txs []*transaction.Transaction, prevHash []byte) *Block {
 	block := Block{
-		Data:     []byte(data),
-		PrevHash: prevHash,
+		Transactions: txs,
+		PrevHash:     prevHash,
 	}
 	nonce, hash := bc.Pow.Run(&block)
 
@@ -74,7 +77,26 @@ func (bc *Blockchain) CreateBlock(data string, prevHash []byte) *Block {
 	return &block
 }
 
-func (bc *Blockchain) AddBlock(data string) error {
+func CreateGenesis(coinbase *transaction.Transaction) *Block {
+	zeroHash := [32]byte{}
+	data := []byte(GenesisData)
+	bytes := bytes.Join([][]byte{
+		data,
+		zeroHash[:],
+	}, []byte{})
+
+	hash := sha256.Sum256(bytes)
+	return &Block{
+		Transactions: []*transaction.Transaction{
+			coinbase,
+		},
+		PrevHash: zeroHash[:],
+		Hash:     hash[:],
+		Nonce:    0,
+	}
+}
+
+func (bc *Blockchain) AddBlock(txs []*transaction.Transaction) error {
 	var dbLashHash []byte
 	err := bc.DB.View(func(txn *badger.Txn) error {
 		item, err := txn.Get([]byte(LashHashKey))
@@ -94,7 +116,7 @@ func (bc *Blockchain) AddBlock(data string) error {
 	}
 
 	// create block
-	newBlock := bc.CreateBlock(data, dbLashHash)
+	newBlock := bc.CreateBlock(txs, dbLashHash)
 
 	// validate block
 	if !bc.Pow.Validate(newBlock) {
@@ -131,34 +153,6 @@ func (bc *Blockchain) Iterator() *BlockchainIterator {
 	return &iter
 }
 
-func (bi *BlockchainIterator) Next() *Block {
-	var block *Block
-	err := bi.DB.View(func(txn *badger.Txn) error {
-		item, err := txn.Get(bi.CurrentHash)
-		if err != nil {
-			return err
-		}
-
-		err = item.Value(func(val []byte) error {
-			block, err = DeserializeBlock(val)
-			if err != nil {
-				return err
-			}
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-		return nil
-	})
-	if err != nil {
-		// log error
-		return nil
-	}
-	bi.CurrentHash = block.PrevHash
-	return block
-}
-
 func (bc *Blockchain) IterateBlockchain() ([]*Block, error) {
 	iter := bc.Iterator()
 
@@ -177,7 +171,124 @@ func (bc *Blockchain) PrintBlocks() error {
 		return err
 	}
 	for _, block := range blocks {
-		fmt.Printf("Hash: %x, Data: %s, PrevHash: %x\n", block.Hash, block.Data, block.PrevHash)
+		fmt.Printf("Hash: %x\nData: %x\nPrevHash: %x\n\n", block.Hash, block.HashTransactions(), block.PrevHash)
 	}
 	return nil
+}
+
+func (bc *Blockchain) FindUnspentTransactions(address string) []*transaction.Transaction {
+	var unspentTxs []*transaction.Transaction
+
+	spentTXOs := make(map[string][]int)
+
+	iter := bc.Iterator()
+
+	for {
+		block := iter.Next()
+		for _, tx := range block.Transactions {
+			txID := hex.EncodeToString(tx.ID)
+
+		Outputs:
+			for outIdx, out := range tx.Outputs {
+				if spentTXOs[txID] != nil {
+					for _, spentOut := range spentTXOs[txID] {
+						if spentOut == outIdx {
+							continue Outputs
+						}
+					}
+				}
+				if out.CanBeUnlocked(address) {
+					unspentTxs = append(unspentTxs, tx)
+				}
+			}
+			if !tx.IsCoinbase() {
+				for _, in := range tx.Inputs {
+					if in.CanUnlock(address) {
+						inTxID := hex.EncodeToString(in.ID)
+						spentTXOs[inTxID] = append(spentTXOs[inTxID], in.Out)
+					}
+				}
+			}
+		}
+		if IsEqualToZeroHash(block.PrevHash) {
+			break
+		}
+	}
+
+	return unspentTxs
+}
+
+func (bc *Blockchain) FindUTXO(address string) []transaction.TxOutput {
+	var UTXOs []transaction.TxOutput
+	unspentTransactions := bc.FindUnspentTransactions(address)
+	for _, tx := range unspentTransactions {
+		for _, output := range tx.Outputs {
+			if output.CanBeUnlocked(address) {
+				UTXOs = append(UTXOs, output)
+			}
+		}
+	}
+	return UTXOs
+}
+
+func (bc *Blockchain) FindSpendableOutputs(address string, amount int) (int, map[string][]int) {
+	unspentOuts := make(map[string][]int)
+	unspentTxs := bc.FindUnspentTransactions(address)
+	accumulated := 0
+
+	for _, tx := range unspentTxs {
+		txID := hex.EncodeToString(tx.ID)
+	Outputs:
+		for outIndex, output := range tx.Outputs {
+			if output.CanBeUnlocked(address) && accumulated < amount {
+				accumulated += output.Value
+				unspentOuts[txID] = append(unspentOuts[txID], outIndex)
+			}
+
+			if accumulated >= amount {
+				break Outputs
+			}
+		}
+
+	}
+	return accumulated, unspentOuts
+}
+
+func (bc *Blockchain) NewTransaction(from, to string, amount int) (*transaction.Transaction, error) {
+	var inputs []transaction.TxInput
+	var outputs []transaction.TxOutput
+
+	accumulated, validOutputs := bc.FindSpendableOutputs(from, amount)
+	if amount > accumulated {
+		return nil, fmt.Errorf("Not enough balance")
+	}
+
+	for txID, outputs := range validOutputs {
+		id, err := hex.DecodeString(txID)
+		if err != nil {
+			return nil, err
+		}
+		for _, outIdx := range outputs {
+			input := transaction.TxInput{ID: id, Out: outIdx, Sig: from}
+			inputs = append(inputs, input)
+		}
+
+	}
+
+	outputs = append(outputs, transaction.TxOutput{
+		Value:  amount,
+		Pubkey: to,
+	})
+
+	if accumulated > amount {
+		outputs = append(outputs, transaction.TxOutput{
+			Value:  accumulated - amount,
+			Pubkey: from,
+		})
+	}
+
+	tx := transaction.Transaction{Inputs: inputs, Outputs: outputs}
+	tx.SetID()
+
+	return &tx, nil
 }
